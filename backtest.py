@@ -14,17 +14,17 @@ competition formula including the unnamed-share rule:
         read_score = sum over the 10 places of ln(max(p_k, 0.0001))
         log_score  = mean of read_score over the reads that exist
 
-Prints the mean log score, the mean top-10 hits per read, the mean agreement
-(fraction of scored places whose actual game was named there) and the
-per-place mean ln(p) so the loss is attributable.
+IMPORTANT: the archive's read cadence is ~6 h, not 1 h.  This backtest
+therefore under-weights how much the real chart persists hour to hour and
+reads as far more diffuse than the server.  Its number is useful for
+ranking variants; the SERVER score is the authority for the level of
+concentration (see README).
 
 Modes:
-  (default)          score main.forecast on every cut (works pre- and
-                     post-calibration-refactor: same signature)
-  --search           sweep main.calibrate's parameters (alpha, wmix, cap,
-                     thresh) over a grid, using the raw (pre-calibration)
-                     per-place mass computed once per cut
-  --alpha/--wmix/--cap/--thresh
+  (default)          score main.forecast on every cut with shipped constants
+  --search           sweep the named constants (persist, neighbour, alpha,
+                     entry_mass, exit_mod) over a grid via overrides
+  --persist/--neighbour/--neighbour2/--alpha/--entry-mass/--exit-mass
                      score one parameter set
   --validate PATH    check a written forecast.json against the output schema
 
@@ -91,6 +91,7 @@ class Tally:
         self.reads = 0
         self.agree = 0
         self.places = 0
+        self.mass = []
 
     def add(self, prob, top10, later):
         named = {k: math.fsum(prob[k].values()) for k in range(1, 11)}
@@ -116,6 +117,8 @@ class Tally:
                 if u in nsets[k]:
                     self.agree += 1
             self.pair_scores.append(rs)
+        for k in range(1, 11):
+            self.mass.append((k, len(prob[k]), round(named[k], 3)))
 
     def mean(self):
         n = len(self.pair_scores)
@@ -126,87 +129,76 @@ class Tally:
         for k in range(1, 11):
             v = self.per_place[k]
             per.append(math.fsum(v) / len(v) if v else float("nan"))
-        print("%-38s log=%8.3f  hits/read=%.2f  agree=%.3f  reads=%d" % (
+        print("%-58s log=%8.3f  hits/read=%.2f  agree=%.3f  reads=%d" % (
             label, self.mean(),
             self.hits / self.reads if self.reads else 0.0,
             self.agree / self.places if self.places else 0.0,
             self.reads))
         print("  per-place mean ln(p): " + " ".join(
             "%d:%6.2f" % (k, per[k - 1]) for k in range(1, 11)))
+        rows = [r for r in self.mass if r[0] == 1]
+        if rows:
+            print("  per-place (rows,mass) at cut0: " + " ".join(
+                "%d=(%d,%.2f)" % r for r in self.mass[:10]))
         return self.mean()
 
 
-def run_forecast_mode(reads, template, cuts):
+def run_forecast_mode(reads, template, cuts, overrides=None):
     tally = Tally()
     for c, _tc, later in cuts:
         task = make_task(template, reads[c][0])
-        prob, top10 = M.forecast(reads[:c + 1], task)
+        prob, top10 = M.forecast(reads[:c + 1], task, overrides)
         tally.add(prob, top10, later)
     return tally
 
 
-def prepare_raws(reads, template, cuts, overrides=None):
-    raws = []
-    for c, _tc, later in cuts:
-        task = make_task(template, reads[c][0])
-        raw, eligible, n_chart = M.raw_forecast(reads[:c + 1], task, overrides)
-        raws.append((raw, eligible, n_chart, later))
-    return raws
-
-
-def run_params(raws, alpha, wmix, mtgt, cap, thresh):
+def run_params(raws, params):
     tally = Tally()
-    for raw, eligible, n_chart, later in raws:
-        prob, top10 = M.calibrate(raw, eligible, n_chart,
-                                  alpha=alpha, wmix=wmix, mtgt=mtgt, cap=cap,
-                                  thresh=thresh)
+    for raw, later in raws:
+        prob, top10 = M.forecast(raw, {}, params)
         tally.add(prob, top10, later)
     return tally
 
 
-GRID_ALPHA = [1.0, 0.95, 0.9, 0.85, 0.8, 0.7, 0.6]
-GRID_WMIX = [0.0, 0.01, 0.02, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30]
-GRID_MTGT = [0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.0]
-GRID_CAP = [None, 0.30, 0.25, 0.20, 0.15, 0.10]
-GRID_THRESH = [0.0, 0.0002, 0.0005, 0.001, 0.002, 0.004]
+GRID_PERSIST = [0.30, 0.40, 0.55, 0.65, 0.75]
+GRID_NEIGH = [0.06, 0.12, 0.18]
+GRID_ALPHA = [1.0, 1.25, 1.5, 1.75, 2.0]
+GRID_ENTRY = [0.03, 0.05, 0.08, 0.10]
+GRID_EXIT = [0.0, 0.10, 0.20]
 
 
 def search(raws):
-    """Coordinate descent: sweep one axis at a time from a neutral start."""
-    best = dict(alpha=1.0, wmix=0.0, mtgt=0.75, cap=None, thresh=0.0)
-    t = run_params(raws, best["alpha"], best["wmix"], best["mtgt"],
-                   best["cap"], best["thresh"])
-    print("start %s -> log=%8.3f" % (best, t.mean()))
+    """Coordinate descent: sweep one axis at a time from the shipped start."""
+    best = dict(persist=M.PERSIST_AT_SAME_PLACE, neighbour=M.NEIGHBOUR_W,
+                alpha=M.TEMPER_ALPHA, entry_mass=M.ENTRY_MASS,
+                exit_mod=M.EXIT_MOD)
+    cur = run_params(raws, best).mean()
+    print("start %s -> log=%8.3f" % (best, cur))
 
-    def sweep(axis, grid):
-        cur = best[axis]
-        results = []
-        for v in grid:
-            trial = dict(best)
-            trial[axis] = v
-            m = run_params(raws, trial["alpha"], trial["wmix"], trial["mtgt"],
-                           trial["cap"], trial["thresh"]).mean()
-            results.append((m, v))
-            print("  %s=%-6s -> log=%8.3f%s" % (
-                axis, v, m, "   (current)" if v == cur else ""))
-            sys.stdout.flush()
-        results.sort(key=lambda x: (-x[0], x[1]))
-        m, v = results[0]
-        if m > run_params(raws, best["alpha"], best["wmix"], best["mtgt"],
-                          best["cap"], best["thresh"]).mean() + 1e-9:
-            best[axis] = v
-            print("  keep %s=%s (log=%8.3f)" % (axis, v, m))
-        else:
-            print("  keep %s=%s (no gain)" % (axis, cur))
+    def eval_params(p):
+        return run_params(raws, p).mean()
 
-    for axis, grid in [("mtgt", GRID_MTGT), ("alpha", GRID_ALPHA),
-                       ("wmix", GRID_WMIX), ("cap", GRID_CAP),
-                       ("thresh", GRID_THRESH), ("mtgt", GRID_MTGT),
-                       ("alpha", GRID_ALPHA), ("wmix", GRID_WMIX),
-                       ("cap", GRID_CAP), ("thresh", GRID_THRESH)]:
-        sweep(axis, grid)
-    t = run_params(raws, best["alpha"], best["wmix"], best["mtgt"],
-                   best["cap"], best["thresh"])
+    for _round in range(2):
+        for axis, grid in [("persist", GRID_PERSIST), ("neighbour", GRID_NEIGH),
+                           ("alpha", GRID_ALPHA), ("entry_mass", GRID_ENTRY),
+                           ("exit_mod", GRID_EXIT)]:
+            results = []
+            for v in grid:
+                trial = dict(best)
+                trial[axis] = v
+                m = eval_params(trial)
+                results.append((m, v))
+                print("  %s=%-6s -> log=%8.3f%s" % (
+                    axis, v, m, "   (current)" if v == best[axis] else ""))
+                sys.stdout.flush()
+            results.sort(key=lambda x: (-x[0], x[1]))
+            m, v = results[0]
+            if m > eval_params(best) + 1e-9:
+                best[axis] = v
+                print("  keep %s=%s (log=%8.3f)" % (axis, v, m))
+            else:
+                print("  keep %s=%s (no gain)" % (axis, best[axis]))
+    t = run_params(raws, best)
     t.report("final %s" % best)
     return t.mean(), best
 
@@ -221,6 +213,7 @@ def validate_output(path):
     assert len(set(top10)) == 10, "top10 games must be distinct"
     seen = set()
     per_place = {}
+    rows_per_place = {}
     for r in rows:
         assert set(r) == {"universe_id", "place", "p"}, "bad row keys: %s" % sorted(r)
         uid, k, p = r["universe_id"], r["place"], r["p"]
@@ -230,22 +223,28 @@ def validate_output(path):
         assert key not in seen, "duplicate (game, place): %r" % (key,)
         seen.add(key)
         per_place[k] = per_place.get(k, 0.0) + p
-        assert len([1 for s in seen if s[1] == k]) <= 100
+        rows_per_place[k] = rows_per_place.get(k, 0) + 1
+        assert rows_per_place[k] <= M.MAX_ROWS_PER_PLACE, \
+            "place %d has %d rows > MAX_ROWS_PER_PLACE" % (k, rows_per_place[k])
     for k, s in sorted(per_place.items()):
         assert s <= 1.0, "place %d mass %.4f > 1" % (k, s)
-    print("validate %s: OK (%d rows, %d places, per-place mass %s)" % (
+    print("validate %s: OK (%d rows, %d places, rows/place %s, mass %s)" % (
         path, len(rows), len(per_place),
+        " ".join("%d=%d" % (k, rows_per_place[k]) for k in sorted(rows_per_place)),
         " ".join("%d=%.3f" % (k, per_place[k]) for k in sorted(per_place))))
+    for k in range(1, 11):
+        assert k in rows_per_place, "place %d missing entirely" % k
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--search", action="store_true")
+    ap.add_argument("--persist", type=float)
+    ap.add_argument("--neighbour", type=float)
+    ap.add_argument("--neighbour2", type=float)
     ap.add_argument("--alpha", type=float)
-    ap.add_argument("--wmix", type=float)
-    ap.add_argument("--mtgt", type=float)
-    ap.add_argument("--cap", type=float)
-    ap.add_argument("--thresh", type=float)
+    ap.add_argument("--entry-mass", dest="entry_mass", type=float)
+    ap.add_argument("--exit-mass", dest="exit_mod", type=float)
     ap.add_argument("--validate", metavar="PATH")
     args = ap.parse_args()
 
@@ -260,21 +259,28 @@ def main():
         len(reads), len(cuts), sum(len(x[2]) for x in cuts)))
 
     if args.search:
-        raws = prepare_raws(reads, template, cuts)
+        raws = [(reads[:c + 1], later) for c, _tc, later in cuts]
         search(raws)
-    elif args.alpha is not None or args.wmix is not None or args.mtgt is not None \
-            or args.cap is not None or args.thresh is not None:
-        alpha = args.alpha if args.alpha is not None else M.ALPHA
-        wmix = args.wmix if args.wmix is not None else M.WMIX
-        mtgt = args.mtgt if args.mtgt is not None else M.MTGT
-        cap = args.cap if args.cap is not None else M.CAP
-        thresh = args.thresh if args.thresh is not None else M.THRESH
-        raws = prepare_raws(reads, template, cuts)
-        run_params(raws, alpha, wmix, mtgt, cap, thresh).report(
-            "params alpha=%.2f wmix=%.2f mtgt=%.2f cap=%s th=%.4f" % (
-                alpha, wmix, mtgt, ("%.2f" % cap) if cap else "off", thresh))
+    elif any(v is not None for v in (args.persist, args.neighbour, args.neighbour2,
+                                     args.alpha, args.entry_mass, args.exit_mod)):
+        params = {}
+        if args.persist is not None:
+            params["persist"] = args.persist
+        if args.neighbour is not None:
+            params["neighbour"] = args.neighbour
+        if args.neighbour2 is not None:
+            params["neighbour2"] = args.neighbour2
+        if args.alpha is not None:
+            params["alpha"] = args.alpha
+        if args.entry_mass is not None:
+            params["entry_mass"] = args.entry_mass
+        if args.exit_mod is not None:
+            params["exit_mod"] = args.exit_mod
+        run_params([(reads[:c + 1], later) for c, _tc, later in cuts],
+                   params).report("params %s" % params)
     else:
-        run_forecast_mode(reads, template, cuts).report("main.forecast (shipped constants)")
+        run_forecast_mode(reads, template, cuts).report(
+            "main.forecast (shipped constants)")
 
 
 if __name__ == "__main__":
