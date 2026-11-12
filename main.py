@@ -35,16 +35,33 @@ from datetime import datetime
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+# honoured for interface compatibility: the model is deterministic and uses
+# no RNG, so the seed never changes any output (verified byte-identical).
+SEED = int(os.environ.get("MAKEFUN_TRIAL_SEED", "20260101") or 20260101)
 
 # ---- hyperparameters (tuned by rolling 72-hour backtests over the archive) ----
-PRIOR_W = 480.0  # pseudo-count blending archive-estimated curves toward the priors
+# ---- calibration (tuned with backtest.py over the archive) ----
+ALPHA = 0.85   # tempering exponent: p^alpha per place (flatter when < 1)
+MTGT = 1.00    # named-mass target per place (rest = unnamed share)
+WMIX = 0.00    # uniform mixture weight over the read's eligible games
+CAP = None     # placeholder; the per-place gradient below is used instead
+CAPS = {1: 0.26, 2: 0.19, 3: 0.14, 4: 0.11, 5: 0.09, 6: 0.08, 7: 0.07,
+        8: 0.06, 9: 0.05, 10: 0.05}   # per-place cap (s=0.75 x base)
+THRESH = 0.008 # flat floor: rows at or below this are not emitted
+
+PRIOR_W = 240.0 # pseudo-count blending archive-estimated curves toward the priors
 MOM = 2.0      # climb multiplier: q *= 1 + MOM * min(-slope, 3) for bench climbers
 DEM = 1.2      # slide multiplier: promotion odds * (1 + DEM * min(-slope, 2))... see code
-BETA = 0.20    # elasticity of promotion odds to current player count (bench only)
+BETA = 0.10    # elasticity of promotion odds to current player count (bench only)
 QCAP = 0.65    # ceiling on a single bench game's hourly membership
 PCAP = 0.90    # maximum named probability mass per place (rest stays unnamed)
-NW = 6         # number of trailing reads used for the momentum slope
+NW = 5         # number of trailing reads used for the momentum slope
 SLOTS = 72     # hours in the scored window
+T_FRESH = 120.0  # leaver horizon: chart reads within this many hours before the last
+REENTRY = 0.0    # re-entry membership floor for fresh leavers (ramps in past 24h)
+TGT_PULL = 0.0   # band re-mass pull toward the empirical bucket distribution (0=off)
+TOPGROWTH = 0.0  # player-growth multiplier on top-10 members' membership
+GSHIFT = 0.0     # growth kernel shift strength (places per unit growth*10)
 
 KNOTS = [6, 18, 30, 42, 54, 66, 78]
 BANDS = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9),
@@ -165,7 +182,7 @@ def norm(vec):
     return [v / s for v in vec]
 
 
-def estimate(reads):
+def estimate(reads, prior_w=PRIOR_W):
     """Estimate membership curves and place kernels from the archive itself."""
     n = len(reads)
     wsum = defaultdict(lambda: defaultdict(float))   # band key -> knot -> weight
@@ -194,8 +211,7 @@ def estimate(reads):
                         (pd_s if h <= 78 else pd_l)[ra][rb] += 1
                 elif rb <= 10:
                     (bed_s if h <= 78 else bed_l)[rb] += 1
-    # blend each band curve with its prior (pseudo-count PRIOR_W)
-    prior_w = PRIOR_W
+    # blend each band curve with its prior (pseudo-count prior_w)
     curves = {}
     for lo, hi in BANDS:
         key = lo
@@ -244,12 +260,193 @@ def interp_curve(curve, h):
     return curve[-1]
 
 
+# band-level re-mass: target buckets for the empirical place distributions
+TARGET_R = [(1, 3), (4, 6), (7, 10), (11, 14), (15, 97)]   # last: bench
+RE_B = 5          # recent-leaver bucket id
+TARGET_SMOOTH = 3.0   # pseudo-counts per bucket toward the raw bucket mass
+TARGET_FMIN, TARGET_FMAX = 0.1, 10.0   # clamp on the re-mass factor
+
+
+def target_bucket(rank):
+    for idx, (lo, hi) in enumerate(TARGET_R):
+        if lo <= rank <= hi:
+            return idx
+    return 4
+
+
+
+
+
+
+
+
+def empirical_band_targets(reads):
+    """Empirical P(bucket of the actual game | place k), over pairs (i, j)
+    with 0 < horizon <= 72h.  FR outcomes (never on the cut chart) are not
+    nameable, so the table is renormalized over the nameable buckets."""
+    counts = [[TARGET_SMOOTH] * 6 for _ in range(11)]
+    n = len(reads)
+    for i in range(n):
+        chart_i = reads[i][1]
+        ti = reads[i][0]
+        seen_recent = set()
+        for rec in reads[max(0, i - 8):i]:
+            if (ti - rec[0]).total_seconds() <= 48 * 3600:
+                seen_recent.update(rec[1])
+        for j in range(i + 1, n):
+            h = (reads[j][0] - ti).total_seconds() / 3600.0
+            if h <= 0 or h > 72.0:
+                continue
+            chart_j = reads[j][1]
+            for k in range(1, 11):
+                u = None
+                for uu, r in chart_j.items():
+                    if r == k:
+                        u = uu
+                        break
+                if u is None:
+                    continue
+                if u in chart_i:
+                    b = target_bucket(chart_i[u])
+                elif u in seen_recent:
+                    b = RE_B
+                else:
+                    continue  # FR: not nameable
+                counts[k][b] += 1.0
+    totals = [math.fsum(row) for row in counts]
+    return {k: [c / totals[k] for c in counts[k]] for k in range(1, 11)}
+
+
 def blend_vecs(a, b, t):
     return [x * (1.0 - t) + y * t for x, y in zip(a, b)]
 
 
-def forecast(reads, task):
-    curves, pd_short, pd_long, bed_short, bed_long = estimate(reads)
+# bench promotion: empirical entry-rate multipliers by (rank bucket, slope bucket)
+CLIMB_R = [(15, 17), (18, 20), (21, 25), (26, 30), (31, 38), (39, 45), (46, 60), (61, 97)]
+CLIMB_S = [(-1e9, -6.0), (-6.0, -2.0), (-2.0, -0.5), (-0.5, 0.5), (0.5, 1e9)]
+CLIMB_G = [(1e-9, 0.0), (0.0, 0.10), (0.10, 0.30), (0.30, 1e9)]   # player growth per read step
+CLIMB_SHRINK = 20.0   # pseudo-counts toward the rank bucket's base rate
+CLIMB_MIN = 0.25      # multiplier clamp
+CLIMB_MAX = 8.0
+CLIMB_MODE = "mult"   # "mult": q *= table;  "replace": bench q = base*mult
+
+
+def climb_bucket(rank, slope_step, growth=None):
+    rb = 7
+    for idx, (lo, hi) in enumerate(CLIMB_R):
+        if lo <= rank <= hi:
+            rb = idx
+            break
+    sb = 4
+    for idx, (lo, hi) in enumerate(CLIMB_S):
+        if lo <= slope_step < hi:
+            sb = idx
+            break
+    gb = 0
+    if growth is not None:
+        for idx, (lo, hi) in enumerate(CLIMB_G):
+            if lo <= growth < hi:
+                gb = idx
+                break
+    else:
+        gb = 1  # no data: neutral bucket
+    return rb, sb, gb
+
+
+def climb_mult_table(reads, nw, shrink=CLIMB_SHRINK):
+    """Empirical bench-entry rates and multipliers by (rank, slope, growth).
+
+    For every read pair (i, j) with 0 < j-i horizon <= 72h, bench games on
+    read i are bucketed by their rank, their rank slope (ranks per read
+    step over the trailing nw reads) and their player-count growth per read
+    step over the same window.  Returns a table with two kinds of entries:
+    (rb, sb, gb) -> multiplier (entry rate / rank-bucket base rate), and
+    (rb, sb, gb, "rate") -> the raw window entry rate itself.
+    """
+    trials = defaultdict(float)
+    entries = defaultdict(float)
+    base_t = defaultdict(float)
+    base_e = defaultdict(float)
+    n = len(reads)
+    for i in range(nw, n):
+        chart_i = reads[i][1]
+        hist = defaultdict(list)
+        plays = defaultdict(list)
+        for rec in reads[i - nw + 1:i + 1]:
+            for u, r in rec[1].items():
+                hist[u].append(r)
+                plays[u].append(rec[2].get(u, 0) or 0)
+        slope = {}
+        growth = {}
+        for u, rh in hist.items():
+            if len(rh) >= 2:
+                slope[u] = (rh[-1] - rh[0]) / (len(rh) - 1)
+                ph = plays[u]
+                if ph[0] > 0:
+                    growth[u] = (ph[-1] - ph[0]) / max(1, len(ph) - 1) / ph[0]
+                else:
+                    growth[u] = None
+            else:
+                slope[u] = 0.0
+                growth[u] = None
+        for j in range(i + 1, n):
+            h = (reads[j][0] - reads[i][0]).total_seconds() / 3600.0
+            if h <= 0 or h > 72.0:
+                continue
+            chart_j = reads[j][1]
+            for u, r in chart_i.items():
+                if r <= 14:
+                    continue
+                rb, sb, gb = climb_bucket(r, slope.get(u, 0.0), growth.get(u))
+                ent = 1.0 if chart_j.get(u, 99) <= 10 else 0.0
+                trials[(rb, sb, gb)] += 1.0
+                entries[(rb, sb, gb)] += ent
+                base_t[rb] += 1.0
+                base_e[rb] += ent
+    table = {}
+    for rb in range(len(CLIMB_R)):
+        bt = base_t.get(rb, 0.0)
+        be = base_e.get(rb, 0.0)
+        base = (be + 1.0) / (bt + 20.0) if bt > 0 else 0.05
+        for sb in range(len(CLIMB_S)):
+            for gb in range(len(CLIMB_G)):
+                t = trials.get((rb, sb, gb), 0.0)
+                e = entries.get((rb, sb, gb), 0.0)
+                rate = (e + shrink * base) / (t + shrink)
+                table[(rb, sb, gb)] = min(CLIMB_MAX, max(CLIMB_MIN, rate / base if base > 0 else 1.0))
+                table[(rb, sb, gb, "rate")] = rate
+    return table
+
+
+def raw_forecast(reads, task, overrides=None):
+    """Run the simulation and return the raw per-place distributions.
+
+    Returns (raw, eligible, n_chart): raw[k] maps game -> untempered
+    probability mass for place k (mass may exceed 1 and must be calibrated
+    before emission), eligible is the candidate set the window is simulated
+    over, n_chart is the size of the last archived chart.
+
+    overrides (dict) lets the backtest vary the simulation constants
+    (t_fresh, reentry, mom, dem, beta, nw, prior_w) without editing them.
+    """
+    ov = dict(overrides or {})
+    t_fresh = ov.pop("t_fresh", T_FRESH)
+    reentry = ov.pop("reentry", REENTRY)
+    mom = ov.pop("mom", MOM)
+    dem = ov.pop("dem", DEM)
+    beta = ov.pop("beta", BETA)
+    qcap = ov.pop("qcap", QCAP)
+    nw = int(ov.pop("nw", NW))
+    prior_w = ov.pop("prior_w", PRIOR_W)
+    tgt_pull = ov.pop("tgt_pull", TGT_PULL)
+    climb_mode = ov.pop("climb_mode", CLIMB_MODE)
+    climb_shrink = ov.pop("climb_shrink", CLIMB_SHRINK)
+    topgrowth = ov.pop("topgrowth", TOPGROWTH)
+    gshift = ov.pop("gshift", GSHIFT)
+    if ov:
+        raise ValueError("unknown overrides: %r" % sorted(ov))
+
+    curves, pd_short, pd_long, bed_short, bed_long = estimate(reads, prior_w)
     t_last = reads[-1][0]
     t0 = task.get("_t0", t_last)
     h0 = max(0.0, (t0 - t_last).total_seconds() / 3600.0)
@@ -261,7 +458,6 @@ def forecast(reads, task):
     # They re-enter at bottom-places at non-trivial rates, so keep them as
     # candidates with a small membership (band 61 curve scaled by recency).
     recent_leavers = {}
-    t_fresh = 48.0
     for when, chart, _ in reads[:-1]:
         age = (t_last - when).total_seconds() / 3600.0
         if age > t_fresh:
@@ -274,7 +470,7 @@ def forecast(reads, task):
         candidates[uid] = 98  # re-entry band key
 
     # --- covariates -------------------------------------------------------
-    window = reads[-NW:]
+    window = reads[-nw:]
     ranks_hist = defaultdict(list)
     for _, chart, _ in window:
         for uid, r in chart.items():
@@ -284,6 +480,12 @@ def forecast(reads, task):
     for uid, rh in ranks_hist.items():
         if len(rh) >= 2:
             slope[uid] = (rh[-1] - rh[0]) / t_span
+    slope_step = {}
+    for uid, rh in ranks_hist.items():
+        if len(rh) >= 2:
+            slope_step[uid] = (rh[-1] - rh[0]) / (len(rh) - 1)
+    climb_t = climb_mult_table(reads, nw, climb_shrink)
+    band_targets = empirical_band_targets(reads)
     play_med = sorted(last_playing.values())[len(last_playing) // 2] if last_playing else 1.0
 
     # --- accumulate p(game, place) over the scored hours -------------------
@@ -295,27 +497,57 @@ def forecast(reads, task):
             key = band_key(rank)
             q = interp_curve(curves[key], h_eff)
             if uid in recent_leavers and h_eff >= 24:
-                # re-entry: fresh leavers regain a bottom place ~5-10% of the time,
-                # ramping in with horizon
-                q = max(q, 0.05 * min(1.0, (h_eff - 24.0) / 72.0))
+                # re-entry: fresh leavers regain a bottom place at the
+                # empirical 16%/72h re-entry rate, ramping in with horizon
+                q = max(q, reentry * min(1.0, (h_eff - 24.0) / 72.0))
             if q <= 1e-4:
                 continue
             sl = slope.get(uid, 0.0)
             if rank <= 10 and uid in last_chart:
                 # slide demotion for games sliding down; promotion damping for risers
                 if sl < 0:
-                    q = min(0.97, q * (1.0 + DEM * min(-sl, 2.0)))
+                    q = min(0.97, q * (1.0 + dem * min(-sl, 2.0)))
                 elif sl > 0:
-                    q = q / (1.0 + DEM * min(sl, 2.0))
+                    q = q / (1.0 + dem * min(sl, 2.0))
+                # player-count growth shifts placement within the top 10:
+                # empirically corr(growth, later place) = -0.32
+                ph = [pl2.get(uid, 0) or 0 for (_, _, pl2) in window]
+                pn = last_playing.get(uid, 0) or 0
+                if len(ph) >= 3 and ph[0] > 0:
+                    growth = (pn - ph[0]) / (len(ph) - 1) / ph[0]
+                    q = min(0.98, q * max(0.5, min(1.6, 1.0 + topgrowth * growth)))
             elif uid in last_chart:
                 pl = last_playing.get(uid, play_med) or play_med
-                q *= max(0.5, min(1.6, (max(pl, 1.0) / max(play_med, 1.0)) ** BETA))
+                q *= max(0.5, min(1.6, (max(pl, 1.0) / max(play_med, 1.0)) ** beta))
                 if sl < 0:
-                    q = min(QCAP, q * (1.0 + MOM * min(-sl, 3.0)))
+                    q = min(qcap, q * (1.0 + mom * min(-sl, 3.0)))
+                ph = [pl2.get(uid, 0) or 0 for (_, _, pl2) in window]
+                p_now = last_playing.get(uid, 0) or 0
+                growth = None
+                if len(ph) >= 3 and ph[0] > 0:
+                    growth = (p_now - ph[0]) / (len(ph) - 1) / ph[0]
+                rb, sb, gb = climb_bucket(rank, slope_step.get(uid, 0.0), growth)
+                if climb_mode == "replace":
+                    # bench q := empirical window entry rate for this bucket
+                    q = max(q, climb_t.get((rb, sb, gb, "rate"), q))
+                else:
+                    q = min(qcap, q * climb_t.get((rb, sb, gb), 1.0))
             if q <= 1e-4:
                 continue
             if rank <= 10 and uid in last_chart:
                 kern = pd_short[rank]
+                # growth kernel shift: a game growing fast tends to land on
+                # a better place than its current one, a shrinking one worse
+                ph = [pl2.get(uid, 0) or 0 for (_, _, pl2) in window]
+                pn = last_playing.get(uid, 0) or 0
+                gr = None
+                if len(ph) >= 3 and ph[0] > 0:
+                    gr = (pn - ph[0]) / (len(ph) - 1) / ph[0]
+                if gr is not None and gshift != 0:
+                    shift = min(3, max(-3, round(gshift * gr * 10.0)))
+                    tgt = rank - int(shift)
+                    if 1 <= tgt <= 10 and tgt != rank:
+                        kern = blend_vecs(kern, pd_short[tgt], min(1.0, abs(gshift * gr) * 2.0))
             else:
                 kern = bed_short
             for k in range(1, 11):
@@ -327,31 +559,121 @@ def forecast(reads, task):
     for uid, d in acc.items():
         for k, p in d.items():
             prob[k][uid] = p / SLOTS
-    for k in range(1, 11):
-        d = prob[k]
-        tot = math.fsum(d.values())
-        if tot > PCAP:
-            f = PCAP / tot
-            for u in d:
-                d[u] *= f
+    # --- band re-mass: scale each place's raw bucket masses toward the
+    # empirical bucket distribution of the actual games, with pull tgt_pull
+    # (0 = off, 1 = full empirical shape).
+    if tgt_pull > 0:
+        for k in range(1, 11):
+            d = prob[k]
+            if not d:
+                continue
+            bucket_mass = [0.0] * 6
+            for uid, p in d.items():
+                if uid in last_chart:
+                    b = target_bucket(last_chart[uid])
+                elif uid in recent_leavers:
+                    b = RE_B
+                else:
+                    continue
+                bucket_mass[b] += p
+            raw_tot = math.fsum(bucket_mass)
+            emp = band_targets[k]
+            emp_tot = math.fsum(emp)
+            if raw_tot <= 0 or emp_tot <= 0:
+                continue
+            for b in range(6):
+                raw_share = bucket_mass[b] / raw_tot
+                emp_share = emp[b]
+                if raw_share > 1e-9:
+                    factor = 1.0 + tgt_pull * (emp_share / max(raw_share, 1e-9) - 1.0)
+                    factor = min(TARGET_FMAX, max(TARGET_FMIN, factor))
+                else:
+                    factor = 1.0
+                if factor != 1.0:
+                    for uid in d:
+                        bu = (target_bucket(last_chart[uid]) if uid in last_chart
+                              else (RE_B if uid in recent_leavers else None))
+                        if bu == b:
+                            d[uid] *= factor
+            # renormalize this place back to the raw total mass
+            m = math.fsum(d.values())
+            if m > 0:
+                f = raw_tot / m
+                for uid in d:
+                    d[uid] *= f
 
-    # prune: naming a game below the unnamed share is strictly worse than not
-    # naming it (it would otherwise receive that share for free), so keep a
-    # row only while its p beats the per-game share of the unnamed remainder.
-    n_chart = max(10, len(last_chart))
+    return prob, candidates, max(10, len(last_chart))
+
+
+def forecast(reads, task):
+    raw, eligible, n_chart = raw_forecast(reads, task)
+    return calibrate(raw, eligible, n_chart, cap=CAPS)
+
+
+def calibrate(raw, eligible, n_chart, alpha=ALPHA, mtgt=MTGT, wmix=WMIX,
+              cap=CAP, thresh=THRESH):
+    """Turn the raw per-place mass into a calibrated, named distribution.
+
+    Steps, in order (all deterministic):
+      1. tempering: raise every p to the power alpha and rescale so the place
+         keeps its raw total mass; alpha < 1 flattens over-confidence
+         (the raw peak at place 1 can exceed 0.3 while the archive's #1 is
+         #1 in none of the practice reads).
+      2. uniform mixture: blend in a uniform component of total weight wmix
+         over every eligible game, so bench and re-entry candidates carry
+         real rows instead of depending on the unnamed share.
+      3. scale the place to the named-mass target mtgt < 1: the remainder
+         1 - mtgt is the unnamed share the scorer spreads evenly over the
+         games of the read that were not named at that place.
+      4. share-prune (greedy, the rule-optimal cut): walking probabilities
+         in descending order, keep naming a game only while its p beats the
+         per-game share of the remaining unnamed mass; then a flat floor
+         thresh and the 100-rows-per-place cap.
+    """
+    prob = {}
+    n_elig = len(eligible)
     for k in range(1, 11):
-        d = prob[k]
+        d = dict(raw[k])
+        tot = math.fsum(d.values())
+        if tot > 0 and alpha != 1.0:
+            powed = {u: p ** alpha for u, p in d.items()}
+            ptot = math.fsum(powed.values())
+            if ptot > 0:
+                f = tot / ptot
+                d = {u: p * f for u, p in powed.items()}
+        if wmix > 0 and n_elig > 0:
+            u_mass = wmix / n_elig
+            row = {u: p * (1.0 - wmix) for u, p in d.items()}
+            for u in eligible:
+                row[u] = row.get(u, 0.0) + u_mass
+            d = row
+        if cap is not None:
+            capk = cap.get(k, 0.15) if isinstance(cap, dict) else cap
+            d = {u: (p if p < capk else capk) for u, p in d.items()}
+        # scale to the named-mass target
+        tot = math.fsum(d.values())
+        if tot > 0 and tot != mtgt:
+            f = mtgt / tot
+            d = {u: p * f for u, p in d.items()}
+        # share-prune: keep a row only while it beats the per-game share of
+        # the unnamed remainder (naming a weaker game would both spend mass
+        # on it and shrink the share the actual answer receives for free).
         kept = {}
         for uid, p in sorted(d.items(), key=lambda x: (-x[1], x[0])):
-            named = math.fsum(kept.values())
-            share = (1.0 - min(named, 1.0)) / max(1, n_chart - len(kept))
-            if p <= share or len(kept) >= 100:
+            if p <= thresh or len(kept) >= 100:
+                break
+            share = (1.0 - min(math.fsum(kept.values()), 1.0)) / max(1, n_chart - len(kept))
+            if p <= share:
                 break
             kept[uid] = p
+        m = math.fsum(kept.values())
+        if m > 0.999:
+            f = 0.999 / m
+            kept = {u: p * f for u, p in kept.items()}
         prob[k] = kept
 
     score = {uid: math.fsum((11 - k) * prob[k].get(uid, 0.0) for k in range(1, 11))
-             for uid in acc}
+             for uid in set().union(*[set(prob[k]) for k in range(1, 11)])}
     top10 = sorted(score, key=lambda u: (-score[u], u))[:10]
     return prob, top10
 
